@@ -1,0 +1,155 @@
+Usage:
+	local queue = void.queue.create(10) -- queue that holds up to 10 buffers
+	local buf1 = void.buffer.fromString "Hello "
+	local buf2 = void.buffer.fromString "World!"
+
+	-- Use whatever threading library to start this thread:
+	-- Multiple threads can access the queue at the same time
+	-- Only one thread can own a buffer at a time
+	-- When a buffer is put into the queue the buffer is invalidated for that thread
+	-- This way, threads are mutable until marked immutable
+	function thread(queueID)
+		local queue = void.queue.fromID(queueID)
+
+		local buf1 = void.queue.await(queue)
+		local buf2 = void.queue.await(queue)
+
+		void.queue.enqueue(queue, void.buffer.concat(buf1, buf2))
+	end
+	start(thread, void.queue.toID(queue))
+
+	void.queue.enqueue(queue, buf1)
+	void.queue.enqueue(queue, buf2)
+
+	local buf12 = void.queue.await(queue)
+	print(void.buffer.asString(buf12))
+
+Methods:
+	Queue:
+		void.queue.create(n) - Creates a queue of buffers with n slots
+		void.queue.toID(queue) - Turns a queue into a global unique identifier for passing across threads
+		void.queue.fromID(id) - Creates a queue from a global unique identifier. This throws an error if it does not exist
+		void.queue.enqueue(queue, buffer, [wait]) - Puts a buffer into the queue. This will block if the buffer is being accessed
+			- If wait is true and the buffer is full, this will block until the buffer can be added to the queue
+			- If wait is false and the buffer is full, this will return false
+		void.queue.await(queue, timeout) - Waits for the next buffer in the queue and returns it, times out in timeout seconds
+		void.queue.count(queue) - Returns the number of buffers in the queue and the total number of buffers in the queue
+
+	Buffer:
+		void.buffer.create(count) - Creates a buffer of count bytes
+        void.buffer.create(buffer) - Creates a buffer from another buffer's data
+		void.buffer.fromString(string) - Creates a buffer from a string
+		void.buffer.fromStruct(structdef, data) - Creates a buffer for a struct definition with data filled out
+		void.buffer.asString(string) - Converts a buffer into a string
+		void.buffer.concat(a, b) - Makes a new buffer out of a and b concatenated together
+		void.buffer.length(buffer) - Returns the length of the buffer
+		void.buffer.view(buffer, index, length) - Creates a new buffer that refers to a specific part of a buffer
+		Various methods to access formatted data in the buffer:
+		void.buffer.pack(buffer, index, packstr, ...) - Puts data into the buffer like string.pack
+		void.buffer.unpack(buffer, index, packstr) - Gets data from a buffer like string.unpack
+		void.buffer.get[U|S|F][8|16|32|64]{LE|BE}(buffer, index)
+			- Retreives data at the given index in the buffer with optional endianess or host endianess
+		void.buffer.set[U|S|F][8|16|32|64]{LE|BE}(buffer, index, value)
+			- Stores data at the given index in the buffer with optional endianess or host endianess
+		void.buffer.grow(buffer, size) - Expands a buffer's allocation by size bytes
+			- This would work by seeing if the free function is the wrapper's free function. If it isn't the operation creates a copy of the data with the wrapper's allocator, copies the data, frees the old data with it's deallocator, then puts in it's own deallocator and data pointer
+		void.buffer.shrink(buffer, size) - Shrinks a buffer's allocation by size bytes
+			- See grow for what happens when the buffer's data isn't owned by the wrapper
+
+	Struct:
+		 void.struct.create(definition) - Creates a struct from a table of field definitions
+			Example:
+				void.struct.create {
+					{"method", "u8"},
+					{"size", "u32le"},
+					{"data", "buffer", size = "size"},
+				}
+				Struct definitions are in the format of {name, type}
+				Buffers in struct definitions can take a constant size or use the size from a field
+					If the size of a buffer is not given, it gives a view that represents from that buffer's index til end of buf
+				Struct definitions can be used inside a struct definition by using the struct as the type
+				You can insert a void type to get the index of something inside the buffer
+				Unions are currently not supported at this time
+				Structs can have options. These are set by having non numerical fields in the table
+		 void.struct.read(struct, buffer, [index = 1]) - Read a struct into a table, optionally with a start index
+		 void.struct.write(struct, buffer, [index = 1], data) - Write a struct into a buffer, optionally with a start index
+		 void.struct.length(struct, [data]) - Get the length of a struct in bytes.
+			- If data is given then it calculates the length of that data, else it returns the smallest possible size
+
+Real World Example:
+	local queue = void.queue.create(10)
+	local rpcstruct = void.struct.create {
+		packed = true, -- Do not insert any padding bytes (For cross arch support)
+		{"method", "u8"},
+		{"id", "u32le"},
+		{"size", "u32le"},
+		{"data", "buffer", size = "size"}
+	}
+
+	local nextRPCID = 0
+	local function sendRPC(method, data)
+		local structdata = {
+			method = method,
+			id = nextRPCID,
+			data = data -- Since buffer size is attached to the size field, size gets automatically filled out
+		}
+
+		local length = void.struct.length(rpcstruct, structdata)
+		local buffer = void.buffer.fromStruct(rpcstruct, structdata)
+
+		void.queue.enqueue(queue, buffer, true) -- We want to suspend execution if the buffer is full
+		nextRPCID = nextRPCID+1
+
+		return nextRPCID-1
+	end
+
+	local readfilestruct = void.struct.create {
+		packed = true, -- Do not insert any padding bytes (For cross arch support)
+		{"filenameSize", "u32le"},
+		{"filename", "buffer", size = "filenameSize"},
+		{"modeSize", "u32le"},
+		{"mode", "buffer", size = "modeSize"}
+	}
+
+	local function readFileAsync(filename, mode, callback)
+		local id = sendRPC(RPC_METHOD_READ_FILE, void.buffer.fromStruct(readfilestruct, {filename=filename,mode=mode}))
+		addCallback(id, callback)
+	end
+
+	-- Thread code:
+	-- Best worker thread ever~
+	function workerthread(queueID)
+		local queue = void.queue.fromID(queueID)
+		local rpcstruct = void.struct.create {
+			packed = true, -- Do not insert any padding bytes (For cross arch support)
+			{"method", "u8"},
+			{"id", "u32le"},
+			{"size", "u32le"},
+			{"data", "buffer", size = "size"}
+		}
+
+		local readfilestruct = void.struct.create {
+			packed = true, -- Do not insert any padding bytes (For cross arch support)
+			{"filenameSize", "u32le"},
+			{"filename", "buffer", size = "filenameSize"},
+			{"modeSize", "u32le"},
+			{"mode", "buffer", size = "modeSize"}
+		}
+
+		while true do
+			local rpcbuffer = void.queue.await(queue)
+			local rpc = void.struct.read(rpcbuffer, rpcstruct)
+
+			if rpc.method == RPC_METHOD_READ_FILE then
+				local arguments = void.struct.read(rpc.data, readfilestruct)
+				local file = io.open(arguments.filename, arguments.mode)
+				local length = file:seek("end")
+				file:seek("begin")
+				local data = void.buffer.create(length)
+				void.buffer.readFile(file, length)
+				file:close()
+
+				-- More stuff here to send back the data buffer...
+			end
+		end
+	end
